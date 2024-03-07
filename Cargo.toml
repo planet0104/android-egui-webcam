@@ -33,6 +33,7 @@ egui-wgpu = { version = "0.22", features = [ "winit" ] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.13.1"
+jni = "0.21.1"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.9"

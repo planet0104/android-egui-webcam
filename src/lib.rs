@@ -177,7 +177,11 @@ pub fn main() {
 #[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(app: AndroidApp) {
+    use jni::JavaVM;
     use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    let vm = app.vm_as_ptr() as *mut JavaVM;
+    let activity = app.activity_as_ptr(); 转换成java Activity
 
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Warn),
