@@ -1,0 +1,5 @@
+[app]
+name = "android-egui-webcam"
+stylized-name = "Android Egui Webcam"
+domain = "example.com"
+template-pack = "egui"
