@@ -83,6 +83,7 @@ name = "android-egui-webcam"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "anyhow",
  "chrono",
  "egui",
  "egui-wgpu",
@@ -134,6 +135,12 @@ checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "anyhow"
+version = "1.0.80"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ad32ce52e4161730f7098c077cd2ed6229b5804ccf99e5366be1ab72a98b4e1"
 
 [[package]]
 name = "arrayref"

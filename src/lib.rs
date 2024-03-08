@@ -1,3 +1,5 @@
+use app::App;
+use utils::load_global_font;
 #[cfg(target_os = "android")]
 use winit::platform::android::activity::AndroidApp;
 
@@ -6,6 +8,9 @@ use winit::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopWindo
 
 use egui_wgpu::winit::Painter;
 use egui_winit::State;
+
+mod utils;
+mod app;
 
 const INITIAL_WIDTH: u32 = 1920;
 const INITIAL_HEIGHT: u32 = 1080;
@@ -53,8 +58,12 @@ fn create_window<T>(
     window
 }
 
-fn _main(event_loop: EventLoop<Event>) {
+fn _main(event_loop: EventLoop<Event>,
+    #[cfg(target_os = "android")]
+    app: AndroidApp
+) {
     let ctx = egui::Context::default();
+    load_global_font(&ctx);
     let repaint_signal = RepaintSignal(std::sync::Arc::new(std::sync::Mutex::new(
         event_loop.create_proxy(),
     )));
@@ -75,7 +84,6 @@ fn _main(event_loop: EventLoop<Event>) {
         false,
     );
     let mut window: Option<winit::window::Window> = None;
-    let mut egui_demo_windows = egui_demo_lib::DemoWindows::default();
 
     event_loop.run(move |event, event_loop, control_flow| match event {
         Resumed => match window {
@@ -95,7 +103,10 @@ fn _main(event_loop: EventLoop<Event>) {
                 let raw_input = state.take_egui_input(window);
 
                 let full_output = ctx.run(raw_input, |ctx| {
-                    egui_demo_windows.ui(ctx);
+                    App::new(
+                        #[cfg(target_os = "android")]
+                        app.clone()
+                    ).show(ctx);
                 });
                 state.handle_platform_output(window, &ctx, full_output.platform_output);
 
@@ -177,46 +188,16 @@ pub fn main() {
 #[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(app: AndroidApp) {
-    use jni::{objects::{JObject, JValueGen}, sys::jobject, JavaVM};
-    use log::{info, warn};
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
     android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Warn),
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
-    unsafe{
-        let vm = &(*(app.vm_as_ptr() as *mut JavaVM));
-
-        let mut env = vm.get_env().unwrap();
-        let version_class = env.find_class("android.os.Build.VERSION").unwrap();
-        let version = env.get_static_field(version_class, "SDK_INT", "I").unwrap().i().unwrap();
-
-        let manager_class = env.find_class("android.content.pm.PackageManager").unwrap();
-        let granted_int = env.get_static_field(manager_class, "PERMISSION_DENIED", "I").unwrap().i().unwrap();
-        info!("SDK_INT={version}");
-
-        if version >= 23{
-            info!("需要申请相机权限!");
-            let activity: JObject<'_> = JObject::from_raw(*(app.activity_as_ptr() as *mut jobject));
-            let permision_str = env.new_string("android.permission.CAMERA").unwrap();
-            let result = env.call_method(activity, "checkPermission", "(Ljava/lang/String;)I", &[
-                JValueGen::Object(&JObject::from(permision_str))
-            ]).unwrap().i().unwrap();
-            if result == granted_int{
-                info!("相机权限已授权！！");
-            }else{
-                info!("相机权限未授权！！");
-            }
-        }else{
-            warn!("sdkversion<23，无需请求相机权限");
-        }
-    }
-    
-
+    let app_clone = app.clone();
 
     let event_loop = EventLoopBuilder::with_user_event()
         .with_android_app(app)
         .build();
-    stop_unwind(|| _main(event_loop));
+    stop_unwind(|| _main(event_loop, app_clone));
 }

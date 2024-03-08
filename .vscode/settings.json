@@ -1,4 +1,14 @@
 {
     //"rust.target": "armv7-linux-androideabi",
     "rust-analyzer.cargo.target": "armv7-linux-androideabi",
+    "cSpell.words": [
+        "eframe",
+        "egui",
+        "jint",
+        "jobject",
+        "Ljava",
+        "Vonwaon",
+        "wgpu",
+        "winit"
+    ],
 }
