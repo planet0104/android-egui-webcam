@@ -11,6 +11,7 @@ use egui_winit::State;
 
 mod utils;
 mod app;
+mod camera;
 
 const INITIAL_WIDTH: u32 = 1920;
 const INITIAL_HEIGHT: u32 = 1080;

@@ -2,6 +2,7 @@
     //"rust.target": "armv7-linux-androideabi",
     "rust-analyzer.cargo.target": "armv7-linux-androideabi",
     "cSpell.words": [
+        "ACAMERA",
         "eframe",
         "egui",
         "jint",
@@ -11,4 +12,5 @@
         "wgpu",
         "winit"
     ],
+    "rust-analyzer.showUnlinkedFileNotification": false,
 }

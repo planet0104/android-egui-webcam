@@ -83,6 +83,34 @@ pub mod permission{
     
 }
 
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+pub mod ffi_helper{
+    use std::ffi::CStr;
+    use anyhow::Result;
+
+    // 假设每个C字符串后面跟着一个null终止符，并且最后一个指针也是null来表示结束
+    pub unsafe fn c_char_arr_to_cstr_arr<'a>(mut camera_ids: *mut *const ::std::os::raw::c_char) -> Result<Vec<&'a CStr>> {
+        // 初始化一个临时Vec来存放CStr实例
+        let mut cstr_vec: Vec<&CStr> = Vec::new();
+
+        // 遍历C字符串指针数组
+        while !camera_ids.is_null() {
+
+            // 解引用指针并创建CStr实例
+            let cstr = CStr::from_ptr(*camera_ids);
+
+            // 将CStr加入vec中
+            cstr_vec.push(cstr);
+
+            // 移动到下一个C字符串指针
+            camera_ids = camera_ids.offset(1);
+        }
+
+        Ok(cstr_vec)
+    }
+}
+
 ///全局加载支持中文的字体
 pub fn load_global_font(ctx: &egui::Context){
     let mut fonts = egui::FontDefinitions::default();
