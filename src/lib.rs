@@ -177,15 +177,43 @@ pub fn main() {
 #[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(app: AndroidApp) {
-    use jni::JavaVM;
+    use jni::{objects::{JObject, JValueGen}, sys::jobject, JavaVM};
+    use log::{info, warn};
     use winit::platform::android::EventLoopBuilderExtAndroid;
-
-    let vm = app.vm_as_ptr() as *mut JavaVM;
-    let activity = app.activity_as_ptr(); 转换成java Activity
 
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Warn),
     );
+
+    unsafe{
+        let vm = &(*(app.vm_as_ptr() as *mut JavaVM));
+
+        let mut env = vm.get_env().unwrap();
+        let version_class = env.find_class("android.os.Build.VERSION").unwrap();
+        let version = env.get_static_field(version_class, "SDK_INT", "I").unwrap().i().unwrap();
+
+        let manager_class = env.find_class("android.content.pm.PackageManager").unwrap();
+        let granted_int = env.get_static_field(manager_class, "PERMISSION_DENIED", "I").unwrap().i().unwrap();
+        info!("SDK_INT={version}");
+
+        if version >= 23{
+            info!("需要申请相机权限!");
+            let activity: JObject<'_> = JObject::from_raw(*(app.activity_as_ptr() as *mut jobject));
+            let permision_str = env.new_string("android.permission.CAMERA").unwrap();
+            let result = env.call_method(activity, "checkPermission", "(Ljava/lang/String;)I", &[
+                JValueGen::Object(&JObject::from(permision_str))
+            ]).unwrap().i().unwrap();
+            if result == granted_int{
+                info!("相机权限已授权！！");
+            }else{
+                info!("相机权限未授权！！");
+            }
+        }else{
+            warn!("sdkversion<23，无需请求相机权限");
+        }
+    }
+    
+
 
     let event_loop = EventLoopBuilder::with_user_event()
         .with_android_app(app)
