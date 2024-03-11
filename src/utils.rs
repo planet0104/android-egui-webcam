@@ -1,9 +1,11 @@
+use dcv_color_primitives::{convert_image, ColorSpace, ImageFormat, PixelFormat};
+use anyhow::Result;
 
 #[allow(dead_code)]
 #[cfg(target_os = "android")]
 pub mod permission{
-    use anyhow::Result;
-    use jni::{objects::{JObject, JValueGen}, sys::{JNIInvokeInterface_, _jobject, jint}, JavaVM};
+    use anyhow::{anyhow, Result};
+    use jni::{objects::{JObject, JString, JValueGen}, sys::{JNIInvokeInterface_, _jobject, jint}, JavaVM};
     use log::info;
     use winit::platform::android::activity::AndroidApp;
 
@@ -19,44 +21,63 @@ pub mod permission{
         unsafe{
             let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut *const JNIInvokeInterface_)?;
             let mut env = vm.attach_current_thread()?;
-            info!("check_self_permission 001");
             let granted_int = env.get_static_field("android/content/pm/PackageManager", "PERMISSION_GRANTED", "I")?.i()?;
-            info!("check_self_permission 002");
             // 创建Java字符串
             let permission_str = env.new_string(permission)?;
             let activity: JObject<'_> = JObject::from_raw(app.activity_as_ptr() as *mut _jobject);
-            info!("check_self_permission 003");
             let result = env.call_method(activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[JValueGen::Object(&JObject::from(permission_str))])?.i()?;
-            info!("check_self_permission result={result}");
             Ok(result == granted_int)
+        }
+    }
+
+    pub fn get_cache_dir(app: &AndroidApp) -> Result<String>{
+        unsafe{
+            let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut *const JNIInvokeInterface_)?;
+            let mut env = vm.attach_current_thread()?;
+            let activity: JObject<'_> = JObject::from_raw(app.activity_as_ptr() as *mut _jobject);
+
+            let file = env.call_method(
+                activity,
+                "getCacheDir",
+                "()Ljava/io/File;",
+                &[],
+            )?;
+
+            if let JValueGen::Object(file) = file{
+                let path = env.call_method(
+                    file,
+                    "getAbsolutePath",
+                    "()Ljava/lang/String;",
+                    &[],
+                )?;
+                
+                if let JValueGen::Object(path) = path{
+                    let path: JString = path.into();
+                    let str = env.get_string(&path)?;
+                    let str = std::ffi::CStr::from_ptr(str.get_raw());
+                    Ok(str.to_str()?.to_string())
+                }else{
+                    Err(anyhow!("object is not a string"))
+                }
+            }else{
+                Err(anyhow!("object is not a file"))
+            }
         }
     }
 
     pub fn request_permissions(app: &AndroidApp, permissions:&[&str], request_code: i32) -> Result<()>{
         unsafe{
             let vm = JavaVM::from_raw(app.vm_as_ptr() as *mut *const JNIInvokeInterface_)?;
-
-            info!("request_permissions 001");
-
             let mut env = vm.attach_current_thread()?;
-            
-            info!("request_permissions 002");
-
             let activity: JObject<'_> = JObject::from_raw(app.activity_as_ptr() as *mut _jobject);
-            info!("request_permissions 003");
 
             // 创建一个Java String数组
             let permission_count = permissions.len() as jint;
-            info!("request_permissions permission_count = {permission_count}");
-            info!("request_permissions 004");
             let java_permission_array = env.new_object_array(permission_count, "java/lang/String", JObject::null())?;
-            info!("request_permissions 005");
             for (index, permission) in permissions.iter().enumerate() {
-                info!("request_permissions new string: {permission}");
                 let permission_str = env.new_string(*permission)?;
                 env.set_object_array_element(&java_permission_array, index as jint, permission_str)?;
             }
-            info!("request_permissions 006");
 
             // 调用requestPermissions方法
             let _ = env.call_method(
@@ -87,27 +108,13 @@ pub mod permission{
 #[cfg(target_os = "android")]
 pub mod ffi_helper{
     use std::ffi::CStr;
-    use anyhow::Result;
 
-    // 假设每个C字符串后面跟着一个null终止符，并且最后一个指针也是null来表示结束
-    pub unsafe fn c_char_arr_to_cstr_arr<'a>(mut camera_ids: *mut *const ::std::os::raw::c_char) -> Result<Vec<&'a CStr>> {
-        // 初始化一个临时Vec来存放CStr实例
-        let mut cstr_vec: Vec<&CStr> = Vec::new();
-
-        // 遍历C字符串指针数组
-        while !camera_ids.is_null() {
-
-            // 解引用指针并创建CStr实例
-            let cstr = CStr::from_ptr(*camera_ids);
-
-            // 将CStr加入vec中
-            cstr_vec.push(cstr);
-
-            // 移动到下一个C字符串指针
-            camera_ids = camera_ids.offset(1);
+    pub unsafe fn get_cstr<'a>(s: *const ::std::os::raw::c_char) -> Option<&'a str>{
+        let cstr = CStr::from_ptr(s);
+        match cstr.to_str(){
+            Ok(s) => Some(s),
+            Err(err) => None
         }
-
-        Ok(cstr_vec)
     }
 }
 
@@ -128,4 +135,34 @@ pub fn load_global_font(ctx: &egui::Context){
         .push("VonwaonBitmap".to_owned());
 
     ctx.set_fonts(fonts);
+}
+
+pub fn yuv_to_rgba(width: usize, height: usize, plan_slice_0:&[u8], plan_slice_1: &[u8], plan_slice_2: &[u8]) -> Result<Vec<u8>>{
+    let src_format = ImageFormat {
+        pixel_format: PixelFormat::I420,
+        color_space: ColorSpace::Bt601,
+        num_planes: 3,
+    };
+
+    let dst_format = ImageFormat {
+        pixel_format: PixelFormat::Bgra,
+        color_space: ColorSpace::Rgb,
+        num_planes: 1,
+    };
+    
+    let mut dst_buffers = vec![0u8; width*height*4];
+
+    convert_image(
+        width as u32,
+        height as u32,
+        &src_format,
+        None,
+        &[&plan_slice_0, &plan_slice_1, &plan_slice_2],
+        &dst_format,
+        None,
+        &mut[&mut dst_buffers],
+    )?;
+    
+    Ok(dst_buffers)
+
 }

@@ -1,16 +1,17 @@
-use std::{sync::{Arc, RwLock}, time::Instant};
-
-use egui::{ColorImage, TextureOptions};
+use std::sync::{Arc, RwLock};
+use anyhow::Result;
+use egui::{Button, ColorImage, Vec2};
 use log::info;
 use winit::platform::android::activity::AndroidApp;
 
-use crate::utils;
+use crate::{camera::Camera, utils};
 
 pub struct App {
     image_buffer: Arc<RwLock<ColorImage>>,
     texture: Option<egui::TextureHandle>,
     #[cfg(target_os = "android")]
     app: AndroidApp,
+    camera: Camera,
 }
 
 impl App {
@@ -22,7 +23,9 @@ impl App {
             image_buffer: Arc::new(RwLock::new(ColorImage::default())),
             texture: None,
             #[cfg(target_os = "android")]
-            app
+            app: app.clone(),
+            #[cfg(target_os = "android")]
+            camera: Camera::new(app.clone()),
         }
     }
 
@@ -46,7 +49,7 @@ impl App {
                 // println!("耗时:{}ms", t1.elapsed().as_millis());
                 
                 ui.label("hello! hello!");
-                if ui.button("申请相机权限").clicked(){
+                if ui.add(Button::new("申请相机权限").min_size(Vec2::new(100., 50.))).clicked(){
                     #[cfg(target_os = "android")]
                     {
                         info!("申请权限。。。");
@@ -54,10 +57,21 @@ impl App {
                         info!("权限申请结果:{:?}", res);
                     }
                 }
-                if ui.button("打开相机").clicked(){
+                if ui.add(Button::new("打开相机").min_size(Vec2::new(100., 50.))).clicked(){
                     #[cfg(target_os = "android")]
                     {
                         info!("打开相机...");
+                        let res = self.camera.open("0");
+                        info!("打开相机:{:?}", res);
+                        let res = self.camera.start_preview(1280, 960);
+                        info!("预览相机:{:?}", res);
+                    }   
+                }
+                if ui.add(Button::new("关闭相机").min_size(Vec2::new(100., 50.))).clicked(){
+                    #[cfg(target_os = "android")]
+                    {
+                        info!("关闭相机...");
+                        self.camera.close();
                     }   
                 }
                 // ui.image((texture.id(), texture.size_vec2()));

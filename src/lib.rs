@@ -86,6 +86,8 @@ fn _main(event_loop: EventLoop<Event>,
     );
     let mut window: Option<winit::window::Window> = None;
 
+    let mut main = App::new(app);
+
     event_loop.run(move |event, event_loop, control_flow| match event {
         Resumed => match window {
             None => {
@@ -104,10 +106,7 @@ fn _main(event_loop: EventLoop<Event>,
                 let raw_input = state.take_egui_input(window);
 
                 let full_output = ctx.run(raw_input, |ctx| {
-                    App::new(
-                        #[cfg(target_os = "android")]
-                        app.clone()
-                    ).show(ctx);
+                    main.show(ctx);
                 });
                 state.handle_platform_output(window, &ctx, full_output.platform_output);
 

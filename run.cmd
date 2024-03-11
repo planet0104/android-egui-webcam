@@ -4,5 +4,4 @@
 :: NDK_HOME = "C:\Users\planet\AppData\Local\Android\Sdk\ndk\26.1.10909125"
 
 :: //在 manifest 中添加 权限: <uses-permission android:name="android.permission.CAMERA" />
-:: <uses-feature android:name="android.hardware.camera2" android:required="true" />
 cargo android run
