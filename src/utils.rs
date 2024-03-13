@@ -1,5 +1,3 @@
-use dcv_color_primitives::{convert_image, ColorSpace, ImageFormat, PixelFormat};
-use anyhow::Result;
 
 #[allow(dead_code)]
 #[cfg(target_os = "android")]
@@ -135,34 +133,4 @@ pub fn load_global_font(ctx: &egui::Context){
         .push("VonwaonBitmap".to_owned());
 
     ctx.set_fonts(fonts);
-}
-
-pub fn yuv_to_rgba(width: usize, height: usize, plan_slice_0:&[u8], plan_slice_1: &[u8], plan_slice_2: &[u8]) -> Result<Vec<u8>>{
-    let src_format = ImageFormat {
-        pixel_format: PixelFormat::I420,
-        color_space: ColorSpace::Bt601,
-        num_planes: 3,
-    };
-
-    let dst_format = ImageFormat {
-        pixel_format: PixelFormat::Bgra,
-        color_space: ColorSpace::Rgb,
-        num_planes: 1,
-    };
-    
-    let mut dst_buffers = vec![0u8; width*height*4];
-
-    convert_image(
-        width as u32,
-        height as u32,
-        &src_format,
-        None,
-        &[&plan_slice_0, &plan_slice_1, &plan_slice_2],
-        &dst_format,
-        None,
-        &mut[&mut dst_buffers],
-    )?;
-    
-    Ok(dst_buffers)
-
 }

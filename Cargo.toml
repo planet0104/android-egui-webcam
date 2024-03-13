@@ -31,8 +31,8 @@ egui_demo_lib = "0.22"
 egui-winit = { version = "0.22", default-features = false }
 egui-wgpu = { version = "0.22", features = [ "winit" ] }
 anyhow = "1"
-dcv-color-primitives = "0.6.1"
 image = { version = "0.24.9" }
+imageproc = "0.23.0"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.13.1"

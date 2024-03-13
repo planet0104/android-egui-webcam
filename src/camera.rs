@@ -1,16 +1,20 @@
 //参考 https://github.com/justinjoy/native-camera2/blob/master/app/src/main/jni/native-camera2-jni.cpp
 //https://github.com/qi-xmu/Android-ndk-camera-zh/blob/b5b3c802c4ecb997e043f166f316eb2c7f3b3c54/app/src/main/cpp/camera_engine.cpp#L114
 //https://github.com/RMerl/asuswrt-merlin.ng/blob/26f484e9427f15675afb228718ca2ee71336856e/release/src/router/ffmpeg/libavdevice/android_camera.c#L229
+//https://github.com/meituan/YOLOv6/blob/e86a483f3f6bded25d45970b56831345a99744a4/deploy/NCNN/Android/app/src/main/jni/ndkcamera.cpp#L68
+//https://github.com/planet0104/lazy_dict/blob/master/lib_layz_dict/src/lib.rs
+//http://www.41post.com/3470/programming/android-retrieving-the-camera-preview-as-a-pixel-array
+//https://stackoverflow.com/questions/51399908/yuv-420-888-byte-format
 
 use core::slice;
-use std::{ffi::{c_int, c_void, CStr}, mem::zeroed, ptr::null_mut};
+use std::{ffi::{c_int, c_void, CStr}, io::Write, mem::zeroed, ptr::null_mut};
 use anyhow::{anyhow, Result};
-use image::RgbaImage;
+use image::{codecs::webp::vp8, imageops::{rotate180, rotate270, rotate90}, GrayImage, ImageBuffer, Rgb, RgbaImage};
 use log::{error, info, warn};
-use ndk_sys::{acamera_metadata_tag, camera_status_t, media_status_t, ACameraCaptureSession, ACameraCaptureSession_setRepeatingRequest, ACameraCaptureSession_stateCallbacks, ACameraDevice, ACameraDevice_StateCallbacks, ACameraDevice_close, ACameraDevice_createCaptureRequest, ACameraDevice_createCaptureSession, ACameraDevice_getId, ACameraDevice_request_template, ACameraIdList, ACameraManager_create, ACameraManager_delete, ACameraManager_deleteCameraIdList, ACameraManager_getCameraCharacteristics, ACameraManager_getCameraIdList, ACameraManager_openCamera, ACameraMetadata, ACameraMetadata_const_entry, ACameraMetadata_free, ACameraMetadata_getConstEntry, ACameraOutputTarget, ACameraOutputTarget_create, ACameraOutputTarget_free, ACaptureRequest, ACaptureRequest_addTarget, ACaptureRequest_free, ACaptureSessionOutput, ACaptureSessionOutputContainer, ACaptureSessionOutputContainer_add, ACaptureSessionOutputContainer_create, ACaptureSessionOutputContainer_free, ACaptureSessionOutput_create, ACaptureSessionOutput_free, AImageReader, AImageReader_ImageListener, AImageReader_acquireLatestImage, AImageReader_getWindow, AImageReader_new, AImageReader_setImageListener, AImage_delete, AImage_getPlaneData, AImage_getPlaneRowStride, AImage_getTimestamp, ANativeWindow, AIMAGE_FORMATS};
+use ndk_sys::{acamera_metadata_tag, camera_status_t, media_status_t, ACameraCaptureSession, ACameraCaptureSession_setRepeatingRequest, ACameraCaptureSession_stateCallbacks, ACameraDevice, ACameraDevice_StateCallbacks, ACameraDevice_close, ACameraDevice_createCaptureRequest, ACameraDevice_createCaptureSession, ACameraDevice_getId, ACameraDevice_request_template, ACameraIdList, ACameraManager_create, ACameraManager_delete, ACameraManager_deleteCameraIdList, ACameraManager_getCameraCharacteristics, ACameraManager_getCameraIdList, ACameraManager_openCamera, ACameraMetadata, ACameraMetadata_const_entry, ACameraMetadata_free, ACameraMetadata_getConstEntry, ACameraOutputTarget, ACameraOutputTarget_create, ACameraOutputTarget_free, ACaptureRequest, ACaptureRequest_addTarget, ACaptureRequest_free, ACaptureSessionOutput, ACaptureSessionOutputContainer, ACaptureSessionOutputContainer_add, ACaptureSessionOutputContainer_create, ACaptureSessionOutputContainer_free, ACaptureSessionOutput_create, ACaptureSessionOutput_free, AImageCropRect, AImageReader, AImageReader_ImageListener, AImageReader_acquireLatestImage, AImageReader_getFormat, AImageReader_getHeight, AImageReader_getWidth, AImageReader_getWindow, AImageReader_new, AImageReader_setImageListener, AImage_delete, AImage_getCropRect, AImage_getNumberOfPlanes, AImage_getPlaneData, AImage_getPlanePixelStride, AImage_getPlaneRowStride, AImage_getTimestamp, AImage_getWidth, ANativeWindow, AIMAGE_FORMATS};
 use winit::platform::android::activity::AndroidApp;
 
-use crate::utils::{ffi_helper, permission::get_cache_dir, yuv_to_rgba};
+use crate::utils::{ffi_helper, permission::get_cache_dir};
 
 #[link(name = "camera2ndk")] extern "C" {}
 
@@ -300,59 +304,119 @@ impl Camera{
         Ok(())
     }
 
-    fn on_image_available(&mut self){
+    fn on_image_available(&mut self) -> Result<()>{
         unsafe{
             let mut image = null_mut();
             let media_status = AImageReader_acquireLatestImage(self.image_reader, &mut image);
             if media_status != media_status_t::AMEDIA_OK {
-                if media_status == media_status_t::AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE {
-                    warn!("An image reader frame was discarded");
+                let msg = if media_status == media_status_t::AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE {
+                    "An image reader frame was discarded".to_string()
                 } else {
-                    error!("Failed to acquire latest image from image reader, error: {:?}.", media_status);
-                }
-            }else{
-                let mut timestamp_ns = 0;
-                let mut row_stride: [i32; 4] = [0, 0, 0, 0];
-                let mut plane_data_length: [i32; 4] = [0, 0, 0, 0];
-                let mut image_plane_data: [*mut u8; 4] = zeroed();
-
-                let _ = AImage_getTimestamp(image, &mut timestamp_ns);
-
-                let _ = AImage_getPlaneRowStride(image, 0, &mut row_stride[0]);
-
-                let _ = AImage_getPlaneData(image, 0, &mut image_plane_data[0], &mut plane_data_length[0]);
-
-
-                let _ = AImage_getPlaneRowStride(image, 1, &mut row_stride[1]);
-                let _ = AImage_getPlaneData(image, 1, &mut image_plane_data[1], &mut plane_data_length[1]);
-                let _ = AImage_getPlaneRowStride(image, 2, &mut row_stride[2]);
-                let _ = AImage_getPlaneData(image, 2, &mut image_plane_data[2], &mut plane_data_length[2]);
-
-                info!("获取到了预览帧 timestamp_ns={timestamp_ns}");
-
-                let plan_slice_0 = slice::from_raw_parts(image_plane_data[0], row_stride[0] as usize * self.preview_height as usize);
-                let plan_slice_1 = slice::from_raw_parts(image_plane_data[1], row_stride[1] as usize * self.preview_height as usize);
-                let plan_slice_2 = slice::from_raw_parts(image_plane_data[2], row_stride[2] as usize * self.preview_height as usize);
-                
-                match yuv_to_rgba(self.preview_width as usize, self.preview_height as usize, plan_slice_0, plan_slice_1, plan_slice_2){
-                    Ok(rgba_data) => {
-                        match get_cache_dir(&self.app){
-                            Ok(cache_dir) => {
-                                let img = RgbaImage::from_raw(self.preview_width as u32, self.preview_height as u32, rgba_data).unwrap();
-                                let yuv_path = format!("{}/{}.jpg", cache_dir, timestamp_ns);
-                                img.save(&yuv_path).unwrap();
-                                info!("临时文件写入成功:{yuv_path}");
-                            },
-                            Err(err) => error!("临时文件夹获取失败:{:?}", err)
-                        };
-                    }
-                    Err(err) => {
-                        error!("yuv转换失败:{:?}", err);
-                    }
-                }
+                    format!("Failed to acquire latest image from image reader, error: {:?}.", media_status)
+                };
+                return Err(anyhow!("{msg}"));
             }
 
+            let mut format = 0;
+            let res = AImageReader_getFormat(self.image_reader, &mut format);
+            if res != media_status_t::AMEDIA_OK {
+                return Err(anyhow!("AImageReader_getFormat error res={:?}.", res));
+            }
+
+            if format != AIMAGE_FORMATS::AIMAGE_FORMAT_YUV_420_888.0 as i32 {
+                return Err(anyhow!("format is not AIMAGE_FORMAT_YUV_420_888"));
+            }
+
+            let mut width = 0;
+            let mut height = 0;
+
+            let res = AImageReader_getWidth(self.image_reader, &mut width);
+            if res != media_status_t::AMEDIA_OK {
+                return Err(anyhow!("AImageReader_getWidth error res={:?}.", res));
+            }
+            let res = AImageReader_getHeight(self.image_reader, &mut height);
+            if res != media_status_t::AMEDIA_OK {
+                return Err(anyhow!("AImageReader_getHeight error res={:?}.", res));
+            }
+
+            info!("获取到了预览帧 {width}x{height}");
+
+            let mut src_rect: AImageCropRect = zeroed();
+            let res = AImage_getCropRect(image, &mut src_rect);
+
+            if res != media_status_t::AMEDIA_OK {
+                return Err(anyhow!("AImage_getCropRect error res={:?}.", res));
+            }
+
+            let mut y_stride = 0;
+            let mut uv_stride = 0;
+            let mut y_pixel = null_mut();
+            let mut u_pixel = null_mut();
+            let mut v_pixel = null_mut();
+            let mut y_len = 0;
+            let mut v_len = 0;
+            let mut u_len = 0;
+            let mut vu_pixel_stride = 0;
+
+            AImage_getPlaneRowStride(image, 0, &mut y_stride);
+            AImage_getPlaneRowStride(image, 1, &mut uv_stride);
+            AImage_getPlaneData(image, 0, &mut y_pixel, &mut y_len);
+            AImage_getPlaneData(image, 1, &mut v_pixel, &mut v_len);
+            AImage_getPlaneData(image, 2, &mut u_pixel, &mut u_len);
+            AImage_getPlanePixelStride(image, 1, &mut vu_pixel_stride);
+
+            println!("y_stride={y_stride}");
+            println!("u_stride={uv_stride}");
+        
+            println!("y_len={y_len}");
+            println!("u_len={u_len}");
+            println!("v_len={v_len}");
+            println!("vu_pixel_stride={vu_pixel_stride}");
+
+            /*
+            图像宽度:1280
+            图像高度: 960
+            y_stride=1280
+            u_stride=1280
+            v_stride=1280
+            y_len=1228800
+            u_len=614399
+            v_len=614399
+            vu_pixel_stride=2
+
+            V 的指针和 U 的指针，实际上指向的是一块数据，他们之前相差1个像素，所以不等于宽度/2
+            Y 的指针是 Y数据+UV数据块的开头，实际上整个AImage是一个完整的yuv数据块
+
+             */
+
+            let mut timestamp_ns = 0;
+            let _ = AImage_getTimestamp(image, &mut timestamp_ns);
+
+            let cache_dir = get_cache_dir(&self.app)?;
+            let gray_path = format!("{}/{}_gray.jpg", cache_dir, timestamp_ns);
+
+            let y_pixel1 = slice::from_raw_parts(y_pixel, y_len as usize);
+
+            let gray = match GrayImage::from_raw(width as u32, height as u32, y_pixel1.to_vec()){
+                None => return Err(anyhow!("GrayImage::from_raw error.")),
+                Some(i) => i
+            };
+            gray.save(&gray_path)?;
+            info!("临时文件写入成功:{gray_path}");
+
+            let yuv_data = slice::from_raw_parts(y_pixel, ((width*height)+(width*height)/2) as usize);
+            let yuv_path = format!("{}/{}.yuv", cache_dir, timestamp_ns);
+            let mut f = std::fs::File::create(&yuv_path)?;
+            f.write_all(&yuv_data)?;
+
+            let rgba_data = decode_yuv420sp(yuv_data, width, height);
+            let img = RgbaImage::from_raw(width as u32, height as u32, rgba_data).unwrap();
+            let jpg_path = format!("{}/{}.jpg", cache_dir, timestamp_ns);
+            img.save(&jpg_path)?;
+            info!("临时文件写入成功:{jpg_path}");
+
             AImage_delete(image);
+            Ok(())
         }
     }
     
@@ -367,7 +431,8 @@ impl Camera{
             unsafe extern "C" fn on_image_available(context: *mut c_void, image_reader: *mut AImageReader){
                 //还原Camera指针
                 let camera = &mut *(context as *mut _ as *mut Camera);
-                camera.on_image_available();
+                let res = camera.on_image_available();
+                println!("on_image_available:{:?}", res);
             }
 
             let camera_ptr: *mut Camera = self as *mut _;
@@ -388,4 +453,41 @@ impl Drop for Camera{
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+/// android: YUV420SP 转 rgb
+pub fn decode_yuv420sp(data:&[u8], width:i32, height:i32) -> Vec<u8>{
+    let frame_size = width * height;
+    let mut yp = 0;
+    let mut rgba_data = Vec::with_capacity(frame_size as usize*4);
+    for j in 0..height{
+        let (mut uvp, mut u, mut v) = ((frame_size + (j >> 1) * width) as usize, 0, 0);
+        for i in 0..width{
+            let mut y = (0xff & data[yp] as i32) - 16;  
+            if y < 0 { y = 0; }
+            if i & 1 == 0{
+                v = (0xff & data[uvp] as i32) - 128;
+                uvp += 1;
+                u = (0xff & data[uvp] as i32) - 128;  
+                uvp += 1;
+            }
+
+            let y1192 = 1192 * y;  
+            let mut r = y1192 + 1634 * v;
+            let mut g = y1192 - 833 * v - 400 * u;
+            let mut b = y1192 + 2066 * u;
+
+            if r < 0 { r = 0; } else if r > 262143 { r = 262143; };
+            if g < 0 { g = 0; } else if g > 262143 { g = 262143; }
+            if b < 0 { b = 0;} else if b > 262143 { b = 262143; }
+
+            let r = (r>>10) & 0xff;
+            let g = (g>>10) & 0xff;
+            let b = (b>>10) & 0xff;
+            rgba_data.extend_from_slice(&[r as u8, g as u8, b as u8, 255]);
+            yp += 1;
+        }
+    }
+
+    rgba_data
 }
