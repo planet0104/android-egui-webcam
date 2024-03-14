@@ -1,4 +1,5 @@
 use app::App;
+use log::info;
 use utils::load_global_font;
 #[cfg(target_os = "android")]
 use winit::platform::android::activity::AndroidApp;
@@ -91,11 +92,16 @@ fn _main(event_loop: EventLoop<Event>,
     event_loop.run(move |event, event_loop, control_flow| match event {
         Resumed => match window {
             None => {
+                info!("窗口 None Resumed 001");
                 window = Some(create_window(event_loop, &mut state, &mut painter));
+                info!("窗口 None Resumed 002");
             }
             Some(ref window) => {
+                info!("窗口 Resumed 001");
                 pollster::block_on(painter.set_window(Some(window))).unwrap();
+                info!("窗口 Resumed 002");
                 window.request_redraw();
+                info!("窗口 Resumed 003");
             }
         },
         Suspended => {

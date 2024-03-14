@@ -1,17 +1,16 @@
-use std::sync::{Arc, RwLock};
-use anyhow::Result;
-use egui::{Button, ColorImage, Vec2};
+use std::sync::mpsc::{channel, Receiver};
+use egui::{vec2, Button, ImageData, Rect, TextureHandle, TextureOptions, Vec2};
 use log::info;
 use winit::platform::android::activity::AndroidApp;
 
 use crate::{camera::Camera, utils};
 
 pub struct App {
-    image_buffer: Arc<RwLock<ColorImage>>,
-    texture: Option<egui::TextureHandle>,
     #[cfg(target_os = "android")]
     app: AndroidApp,
     camera: Camera,
+    frame_texture: Option<TextureHandle>,
+    image_receiver: Receiver<ImageData>,
 }
 
 impl App {
@@ -19,34 +18,39 @@ impl App {
         #[cfg(target_os = "android")]
         app: AndroidApp
     ) -> Self{
+
+        let (image_sender, image_receiver) = channel();
         Self{
-            image_buffer: Arc::new(RwLock::new(ColorImage::default())),
-            texture: None,
+            frame_texture: None,
             #[cfg(target_os = "android")]
             app: app.clone(),
             #[cfg(target_os = "android")]
-            camera: Camera::new(app.clone()),
+            camera: Camera::new(app.clone(), image_sender),
+            image_receiver
         }
     }
 
     pub fn show(&mut self, ctx: &egui::Context) {
-        egui::Window::new("app")
-            .default_width(320.0)
+        egui::Window::new("Camera")
             .show(ctx, |ui| {
-                // let texture: &mut egui::TextureHandle = self.texture.get_or_insert_with(|| {
-                //     // Load the texture only once.
-                //     ui.ctx().load_texture(
-                //         "my-image",
-                //         egui::ColorImage::example(),
-                //         Default::default()
-                //     )
-                // });
-    
-                // let t1 = Instant::now();
-                // if let Ok(buf) = self.image_buffer.try_read(){
-                //     texture.set(buf.clone(), TextureOptions::LINEAR);
-                // }
-                // println!("耗时:{}ms", t1.elapsed().as_millis());
+
+                if self.frame_texture.is_none(){
+                    self.frame_texture.replace(ui.ctx().load_texture(
+                        "my-image",
+                        egui::ColorImage::example(),
+                        Default::default()
+                    ));
+                }
+
+                let frame_texture = self.frame_texture.as_mut().unwrap();
+
+                if let Ok(buf) = self.image_receiver.try_recv(){
+                    frame_texture.set(buf, TextureOptions::LINEAR);
+                }
+
+                //1280x960
+                //426x320
+                ui.image(frame_texture.id(), [320., 426.]);
                 
                 ui.label("hello! hello!");
                 if ui.add(Button::new("申请相机权限").min_size(Vec2::new(100., 50.))).clicked(){
@@ -74,7 +78,6 @@ impl App {
                         self.camera.close();
                     }   
                 }
-                // ui.image((texture.id(), texture.size_vec2()));
             });
     }
 }

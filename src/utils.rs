@@ -134,3 +134,56 @@ pub fn load_global_font(ctx: &egui::Context){
 
     ctx.set_fonts(fonts);
 }
+
+
+//RGBA顺时针旋转90度
+pub fn rotate90(src_buffer: &[u8], new_buffer:&mut [u8], src_width: usize, src_height:usize) -> (usize, usize){
+    let (new_width, new_height) = (src_height, src_width);
+    for (y, row) in src_buffer.chunks(src_width*4).enumerate(){
+        //tx = src_height-y-1;
+        //ty = sx;
+        let n = (src_height-y-1)*4;
+        for (x, pixel) in row.chunks(4).enumerate(){
+            let p = x*new_width*4+n;
+            new_buffer[p] = pixel[0];
+            new_buffer[p+1] = pixel[1];
+            new_buffer[p+2] = pixel[2];
+            new_buffer[p+3] = pixel[3];
+        }
+    }
+    (new_width, new_height)
+}
+
+//RGBA顺时针旋转180度
+pub fn rotate180(src_buffer:&[u8], new_buffer:&mut [u8], width: usize, height: usize) -> (usize, usize){
+    let stride = width*4;
+    let mut p = src_buffer.len()-1;
+    for row in src_buffer.chunks(stride){
+        for pixel in row.chunks(4){
+            new_buffer[p-3] = pixel[0];
+            new_buffer[p-2] = pixel[1];
+            new_buffer[p-1] = pixel[2];
+            new_buffer[p] = pixel[3];
+            p -= 4;
+        }
+    }
+    (width, height)
+}
+
+//RGBA顺时针旋转270度
+pub fn rotate270(src_buffer: &[u8], new_buffer:&mut [u8], src_width: usize, src_height:usize) -> (usize, usize){
+    let (new_width, new_height) = (src_height, src_width);
+    let src_stride = src_width*4;
+    let new_stride = new_width*4;
+    for (y, row) in src_buffer.chunks(src_stride).enumerate(){//每一行
+        let j = y*4;
+        for (x, pixel) in row.chunks(4).enumerate(){//每一列
+            let p = (src_width-x-1)*new_stride+j;
+            new_buffer[p] = pixel[0];
+            new_buffer[p+1] = pixel[1];
+            new_buffer[p+2] = pixel[2];
+            new_buffer[p+3] = pixel[3];
+        }
+    }
+    (new_width, new_height)
+}

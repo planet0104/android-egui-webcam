@@ -7,14 +7,17 @@
 //https://stackoverflow.com/questions/51399908/yuv-420-888-byte-format
 
 use core::slice;
-use std::{ffi::{c_int, c_void, CStr}, io::Write, mem::zeroed, ptr::null_mut};
+use std::{borrow::Cow, ffi::{c_int, c_void, CStr}, io::Write, mem::zeroed, ptr::null_mut, sync::mpsc::Sender, time::Instant};
 use anyhow::{anyhow, Result};
-use image::{codecs::webp::vp8, imageops::{rotate180, rotate270, rotate90}, GrayImage, ImageBuffer, Rgb, RgbaImage};
-use log::{error, info, warn};
+use egui::{Color32, ColorImage, ImageData};
+use image::{imageops::{rotate180, rotate270, rotate90}, GrayImage, ImageBuffer, Rgb, RgbaImage};
+use log::{error, info};
 use ndk_sys::{acamera_metadata_tag, camera_status_t, media_status_t, ACameraCaptureSession, ACameraCaptureSession_setRepeatingRequest, ACameraCaptureSession_stateCallbacks, ACameraDevice, ACameraDevice_StateCallbacks, ACameraDevice_close, ACameraDevice_createCaptureRequest, ACameraDevice_createCaptureSession, ACameraDevice_getId, ACameraDevice_request_template, ACameraIdList, ACameraManager_create, ACameraManager_delete, ACameraManager_deleteCameraIdList, ACameraManager_getCameraCharacteristics, ACameraManager_getCameraIdList, ACameraManager_openCamera, ACameraMetadata, ACameraMetadata_const_entry, ACameraMetadata_free, ACameraMetadata_getConstEntry, ACameraOutputTarget, ACameraOutputTarget_create, ACameraOutputTarget_free, ACaptureRequest, ACaptureRequest_addTarget, ACaptureRequest_free, ACaptureSessionOutput, ACaptureSessionOutputContainer, ACaptureSessionOutputContainer_add, ACaptureSessionOutputContainer_create, ACaptureSessionOutputContainer_free, ACaptureSessionOutput_create, ACaptureSessionOutput_free, AImageCropRect, AImageReader, AImageReader_ImageListener, AImageReader_acquireLatestImage, AImageReader_getFormat, AImageReader_getHeight, AImageReader_getWidth, AImageReader_getWindow, AImageReader_new, AImageReader_setImageListener, AImage_delete, AImage_getCropRect, AImage_getNumberOfPlanes, AImage_getPlaneData, AImage_getPlanePixelStride, AImage_getPlaneRowStride, AImage_getTimestamp, AImage_getWidth, ANativeWindow, AIMAGE_FORMATS};
+use pollster::FutureExt;
+use wgpu::{BindGroup, ComputePipeline, Device, Limits, Queue, Texture};
 use winit::platform::android::activity::AndroidApp;
 
-use crate::utils::{ffi_helper, permission::get_cache_dir};
+use crate::utils::{self, ffi_helper, permission::get_cache_dir};
 
 #[link(name = "camera2ndk")] extern "C" {}
 
@@ -36,10 +39,17 @@ pub struct Camera{
     device_state_callbacks: ACameraDevice_StateCallbacks,
     preview_width: i32,
     preview_height: i32,
+    timer: Instant,
+    frame_count: i32,
+    decoder_gpu: Option<YuvGpuDecoder>,
+    rgba_buffer: Vec<u8>,
+    image_sender: Sender<ImageData>,
+    lens_facing: u8,
+    sensor_orientation: i32,
 }
 
 impl Camera{
-    pub fn new(app: AndroidApp) -> Self {
+    pub fn new(app: AndroidApp, image_sender: Sender<ImageData>) -> Self {
         Self { camera_device: null_mut(), capture_request: null_mut(), camera_output_target: null_mut(), session_output: null_mut(), capture_session_output_container: null_mut(), image_reader: null_mut(), image_formats: vec![], camera_id: None, image_listener: AImageReader_ImageListener{
             context: null_mut(),
             onImageAvailable: None,
@@ -49,18 +59,21 @@ impl Camera{
         app,
         preview_width: 0,
         preview_height: 0,
+        timer: Instant::now(),
+        frame_count: 0,
+        decoder_gpu: None,
+        rgba_buffer: vec![],
+        image_sender,
+        lens_facing: 0,
+        sensor_orientation: 0,
         }
     }
 
     pub fn open(&mut self, camera_id: &str) -> Result<()>{
         unsafe{
-            info!("open camera 001..");
             let camera_manager = ACameraManager_create();
-            info!("open camera 002..");
             let mut camera_id_list_raw = null_mut();
-            info!("open camera 003..");
             let camera_status = ACameraManager_getCameraIdList(camera_manager, &mut camera_id_list_raw);
-            info!("open camera 004..");
             if camera_status != camera_status_t::ACAMERA_OK {
                 return Err(anyhow!("Failed to get camera id list (reason: {:?})", camera_status));
             }
@@ -79,11 +92,7 @@ impl Camera{
                 return Err(anyhow!("No camera device detected."));
             }
 
-            info!("open camera 007..");
-
             let camera_ids = slice::from_raw_parts(camera_id_list.cameraIds, camera_id_list.numCameras as usize);
-
-            info!("open camera 008..");
 
             let camera_id_strings:Vec<String> = camera_ids.iter().map(|v| CStr::from_ptr(*v).to_str().unwrap_or("").to_string()).collect();
             info!("camera_ids: {:?}", camera_id_strings);
@@ -117,6 +126,8 @@ impl Camera{
             let (lens_facing, sensor_orientation) = Camera::get_sensor_orientation(camera_metadata);
             info!("lens_facing: {lens_facing}");
             info!("sensor_orientation: {sensor_orientation}");
+            self.lens_facing = lens_facing;
+            self.sensor_orientation = sensor_orientation;
 
             // 获取相机支持的分辨率
             self.image_formats = Camera::get_video_size(camera_metadata)?;
@@ -158,7 +169,7 @@ impl Camera{
             ACameraMetadata_getConstEntry(camera_metadata,acamera_metadata_tag::ACAMERA_SENSOR_ORIENTATION.0, &mut sensor_orientation);
 
             let u8_arr = slice::from_raw_parts(lens_facing.data.u8_, lens_facing.count as usize);
-            let i32_arr = slice::from_raw_parts(lens_facing.data.i32_, lens_facing.count as usize);
+            let i32_arr = slice::from_raw_parts(sensor_orientation.data.i32_, sensor_orientation.count as usize);
             let lens_facing = u8_arr[0];
             let sensor_orientation = i32_arr[0];
             (lens_facing, sensor_orientation)
@@ -238,6 +249,8 @@ impl Camera{
     pub fn start_preview(&mut self, width: i32, height: i32) -> Result<()>{
         self.preview_width = width;
         self.preview_height = height;
+        self.decoder_gpu = Some(YuvGpuDecoder::new(width as u32, height as u32)?);
+        self.rgba_buffer = vec![0; (width * height * 4) as usize];
         self.create_image_reader(width, height, AIMAGE_FORMATS::AIMAGE_FORMAT_YUV_420_888)?;
         unsafe{
             let camera_status = ACameraDevice_createCaptureRequest(self.camera_device, ACameraDevice_request_template::TEMPLATE_PREVIEW, &mut self.capture_request);
@@ -306,6 +319,7 @@ impl Camera{
 
     fn on_image_available(&mut self) -> Result<()>{
         unsafe{
+            let t = Instant::now();
             let mut image = null_mut();
             let media_status = AImageReader_acquireLatestImage(self.image_reader, &mut image);
             if media_status != media_status_t::AMEDIA_OK {
@@ -339,7 +353,7 @@ impl Camera{
                 return Err(anyhow!("AImageReader_getHeight error res={:?}.", res));
             }
 
-            info!("获取到了预览帧 {width}x{height}");
+            // info!("获取到了预览帧 {width}x{height}");
 
             let mut src_rect: AImageCropRect = zeroed();
             let res = AImage_getCropRect(image, &mut src_rect);
@@ -365,13 +379,13 @@ impl Camera{
             AImage_getPlaneData(image, 2, &mut u_pixel, &mut u_len);
             AImage_getPlanePixelStride(image, 1, &mut vu_pixel_stride);
 
-            println!("y_stride={y_stride}");
-            println!("u_stride={uv_stride}");
+            // println!("y_stride={y_stride}");
+            // println!("u_stride={uv_stride}");
         
-            println!("y_len={y_len}");
-            println!("u_len={u_len}");
-            println!("v_len={v_len}");
-            println!("vu_pixel_stride={vu_pixel_stride}");
+            // println!("y_len={y_len}");
+            // println!("u_len={u_len}");
+            // println!("v_len={v_len}");
+            // println!("vu_pixel_stride={vu_pixel_stride}");
 
             /*
             图像宽度:1280
@@ -389,31 +403,44 @@ impl Camera{
 
              */
 
-            let mut timestamp_ns = 0;
-            let _ = AImage_getTimestamp(image, &mut timestamp_ns);
-
-            let cache_dir = get_cache_dir(&self.app)?;
-            let gray_path = format!("{}/{}_gray.jpg", cache_dir, timestamp_ns);
-
-            let y_pixel1 = slice::from_raw_parts(y_pixel, y_len as usize);
-
-            let gray = match GrayImage::from_raw(width as u32, height as u32, y_pixel1.to_vec()){
-                None => return Err(anyhow!("GrayImage::from_raw error.")),
-                Some(i) => i
-            };
-            gray.save(&gray_path)?;
-            info!("临时文件写入成功:{gray_path}");
-
             let yuv_data = slice::from_raw_parts(y_pixel, ((width*height)+(width*height)/2) as usize);
-            let yuv_path = format!("{}/{}.yuv", cache_dir, timestamp_ns);
-            let mut f = std::fs::File::create(&yuv_path)?;
-            f.write_all(&yuv_data)?;
+            // info!("gpu yuv_data:{}", yuv_data.len());
+            let t = Instant::now();
+            // info!("start gpu decode...");
+            //GPU转换耗时 6~8毫秒左右，有时会是10ms左右
+            self.decoder_gpu.as_mut().unwrap().decode(&yuv_data, &mut self.rgba_buffer)?;
+            let mut rotate_image = RgbaImage::from_raw(width as u32, height as u32, self.rgba_buffer.to_vec()).unwrap();
+            
+            //旋转
+            match self.sensor_orientation{
+                90 => {
+                    rotate_image = rotate90(&rotate_image);
+                }
+                180 => {
+                    rotate_image = rotate180(&rotate_image);
+                }
+                270 => {
+                    rotate_image = rotate270(&rotate_image);
+                }
+                _ =>{
+                    //不用旋转，使用原buffer
+                    
+                }
+            }
+            self.image_sender.send(ImageData::Color(ColorImage::from_rgba_unmultiplied([rotate_image.width() as usize, rotate_image.height() as usize], &rotate_image)))?;
+            info!("gpu decode:{}ms {width}x{height} orientation:{} => {}x{}", t.elapsed().as_millis(), self.sensor_orientation, rotate_image.width(), rotate_image.height());
 
-            let rgba_data = decode_yuv420sp(yuv_data, width, height);
-            let img = RgbaImage::from_raw(width as u32, height as u32, rgba_data).unwrap();
-            let jpg_path = format!("{}/{}.jpg", cache_dir, timestamp_ns);
-            img.save(&jpg_path)?;
-            info!("临时文件写入成功:{jpg_path}");
+            // 预览回调帧率正常是 30FPS
+            self.frame_count += 1;
+            if self.timer.elapsed().as_millis() > 1000{
+                info!("预览 FPS:{}", self.frame_count);
+                self.timer = Instant::now();
+                self.frame_count = 0;
+            }
+
+            // CPU转换耗时12ms~23ms，正常约19ms
+            // let rgba_data = decode_yuv420sp(yuv_data, width, height);
+            // info!("rgba cpu转换耗时:{}ms rgba_data:{}", t.elapsed().as_millis(), rgba_data.len());
 
             AImage_delete(image);
             Ok(())
@@ -490,4 +517,350 @@ pub fn decode_yuv420sp(data:&[u8], width:i32, height:i32) -> Vec<u8>{
     }
 
     rgba_data
+}
+
+
+struct YuvGpuDecoder{
+    device: Device,
+    queue: Queue,
+    width: u32,
+    height: u32,
+    y_texture: Texture,
+    u_texture: Texture,
+    easu_texture: Texture,
+    texture_size: wgpu::Extent3d,
+    u_size: wgpu::Extent3d,
+    compute_pipeline_yuv: ComputePipeline,
+    compute_yuv_bind_group: BindGroup,
+    padded_bytes_per_row: usize,
+    unpadded_bytes_per_row: usize,
+}
+
+impl YuvGpuDecoder{
+    pub fn new(width: u32, height:u32) -> Result<Self>{
+        info!("create YuvGpuDecoder {width}x{height}");
+        //------------------------------------------------------
+        // 初始化硬件设备
+        //------------------------------------------------------
+
+        info!("create YuvGpuDecoder instance...");
+
+        let instance = wgpu::Instance::default();
+
+        info!("create YuvGpuDecoder adapter...");
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptionsBase {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .block_on()
+            .ok_or(anyhow::anyhow!("Couldn't create the adapter"))?;
+        
+        info!("create YuvGpuDecoder device,adapter...");
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: None,
+                    features: wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER,
+                    limits: Limits::default(),
+                },
+                None,
+            )
+            .block_on()?;
+
+
+        //------------------------------------------------------
+        // 创建 pipeline layout、compute pipeline、bind group layout 和 shader module
+        //------------------------------------------------------
+        info!("create YuvGpuDecoder compute_texture_yuv_bind_group_layout...");
+        let compute_texture_yuv_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(
+                        // SamplerBindingType::Comparison is only for TextureSampleType::Depth
+                        // SamplerBindingType::Filtering if the sample_type of the texture is:
+                        //     TextureSampleType::Float { filterable: true }
+                        // Otherwise you'll get an error.
+                        wgpu::SamplerBindingType::Filtering,
+                    ),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("texture_bind_group_layout"),
+        });
+        info!("create YuvGpuDecoder compute_yuv_pipeline_layout...");
+        let compute_yuv_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[&compute_texture_yuv_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        info!("create YuvGpuDecoder compute_pipeline_yuv...");
+        let compute_pipeline_yuv = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("compute_pipeline"),
+            layout: Some(&compute_yuv_pipeline_layout),
+            module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("compute_shader_module"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("yuv2rgb.wgsl"))),
+            }),
+            entry_point: "main",
+        });
+
+        //------------------------------------------------------
+        // 创建纹理、纹理视图、采样器和缓冲区，并设置它们的相关描述符
+        //------------------------------------------------------
+        info!("create YuvGpuDecoder texture_size...");
+        let texture_size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let u_size = wgpu::Extent3d {
+            width: width / 2,
+            height: height / 2,
+            depth_or_array_layers: 1,
+        };
+        info!("create YuvGpuDecoder y_texture...");
+        let y_texture = device.create_texture(&wgpu::TextureDescriptor {
+            // All textures are stored as 3D, we represent our 2D texture
+            // by setting depth to 1.
+            size: texture_size,
+            mip_level_count: 1, // We'll talk about this a little later
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Most images are stored using sRGB so we need to reflect that here.
+            format: wgpu::TextureFormat::R8Unorm,
+            // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
+            // COPY_DST means that we want to copy data to this texture
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label: Some("y_texture"),
+            view_formats: &[],
+        });
+
+        info!("create YuvGpuDecoder u_texture...");
+        let u_texture = device.create_texture(&wgpu::TextureDescriptor {
+            // All textures are stored as 3D, we represent our 2D texture
+            // by setting depth to 1.
+            size: u_size,
+            mip_level_count: 1, // We'll talk about this a little later
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Most images are stored using sRGB so we need to reflect that here.
+            format: wgpu::TextureFormat::Rg8Unorm,
+            // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
+            // COPY_DST means that we want to copy data to this texture
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label: Some("uv_texture"),
+            view_formats: &[],
+        });
+
+        info!("create YuvGpuDecoder easu_texture...");
+        let easu_texture = device.create_texture(&wgpu::TextureDescriptor {
+            // All textures are stored as 3D, we represent our 2D texture
+            // by setting depth to 1.
+            size: texture_size,
+            mip_level_count: 1, // We'll talk about this a little later
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Most images are stored using sRGB so we need to reflect that here.
+            // format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
+            // COPY_DST means that we want to copy data to this texture
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::STORAGE_BINDING,
+            label: Some("diffuse_texture"),
+            view_formats: &[],
+        });
+
+        info!("create YuvGpuDecoder y_texture_view...");
+        let y_texture_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let u_texture_view = u_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let easu_texture_view = easu_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uv_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToBorder,
+            address_mode_v: wgpu::AddressMode::ClampToBorder,
+            address_mode_w: wgpu::AddressMode::ClampToBorder,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        info!("create YuvGpuDecoder compute_yuv_bind_group...");
+        let compute_yuv_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &compute_texture_yuv_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&y_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&u_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&uv_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&easu_texture_view),
+                },
+            ],
+            label: Some("yuv_bind_group2"),
+        });
+
+        let padded_bytes_per_row = YuvGpuDecoder::padded_bytes_per_row(width);
+        let unpadded_bytes_per_row = width as usize * 4;
+
+        Ok(Self { device, queue, width, height, y_texture, u_texture, easu_texture, texture_size, u_size, compute_pipeline_yuv, compute_yuv_bind_group, padded_bytes_per_row, unpadded_bytes_per_row})
+    }
+
+    fn decode(&mut self, data: &[u8], output:&mut [u8]) -> Result<()>{
+        //------------------------------------------------------
+        // YUV数据写入纹理中
+        //------------------------------------------------------
+
+        let y_data = &data[..(self.width*self.height) as usize];
+        let uv_data = &data[(self.width*self.height) as usize..];
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTextureBase {
+                texture: &self.y_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &y_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(self.width),
+                rows_per_image: Some(self.height),
+            },
+            self.texture_size,
+        );
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTextureBase {
+                texture: &self.u_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &uv_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(self.width),
+                rows_per_image: Some(self.height),
+            },
+            self.u_size,
+        );
+        
+
+        //------------------------------------------------------
+        // 开始新的计算 pass
+        //------------------------------------------------------
+        
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: None },
+        );
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default() );
+            cpass.set_pipeline(&self.compute_pipeline_yuv);
+            cpass.set_bind_group(0, &self.compute_yuv_bind_group, &[]);
+            cpass.dispatch_workgroups(self.width / 8, self.height / 8, 1);
+        }
+
+        let output_buffer_size =
+        self.padded_bytes_per_row as u64 * self.height as u64 * std::mem::size_of::<u8>() as u64;
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: output_buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                aspect: wgpu::TextureAspect::All,
+                texture: &self.easu_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &output_buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_bytes_per_row as u32),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            self.texture_size,
+        );
+
+        self.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = output_buffer.slice(..);
+        buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let padded_data = buffer_slice.get_mapped_range();
+
+        for (padded, pixels) in padded_data
+            .chunks_exact(self.padded_bytes_per_row)
+            .zip(output.chunks_exact_mut(self.unpadded_bytes_per_row))
+        {
+            pixels.copy_from_slice(&padded[..self.unpadded_bytes_per_row]);
+        }
+        Ok(())
+    }
+
+    /// Compute the next multiple of 256 for texture retrieval padding.
+    pub fn padded_bytes_per_row(width: u32) -> usize {
+        let bytes_per_row = width as usize * 4;
+        let padding = (256 - bytes_per_row % 256) % 256;
+        bytes_per_row + padding
+    }
+
 }
