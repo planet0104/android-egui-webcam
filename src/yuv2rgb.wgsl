@@ -40,7 +40,7 @@ fn main(@builtin(workgroup_id) WorkGroupID : vec3<u32>,
     var g = 1.164 * (y) - 0.813 * (v) - 0.392 * (u);
     var b = 1.164 * (y) + 2.017 * (u);
     var rgb : vec3<f32> = vec3<f32>(r,g,b);
-    rgb = pow(rgb,vec3<f32>(2.2));
+    // rgb = pow(rgb,vec3<f32>(2.2));
 
     textureStore(rgbstorage, baseIndex, vec4<f32>(rgb, 1.0));
 }

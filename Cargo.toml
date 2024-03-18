@@ -33,6 +33,8 @@ egui-wgpu = { version = "0.22", features = [ "winit" ] }
 anyhow = "1"
 image = { version = "0.24.9" }
 imageproc = "0.23.0"
+thread-id = "4.2.1"
+bytemuck = "1.14.3"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.13.1"

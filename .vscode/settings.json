@@ -5,6 +5,8 @@
         "ACAMERA",
         "AIMAGE",
         "AMEDIA",
+        "bytemuck",
+        "cpass",
         "easu",
         "eframe",
         "egui",

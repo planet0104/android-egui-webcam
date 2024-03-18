@@ -14,7 +14,7 @@ use image::{imageops::{rotate180, rotate270, rotate90}, GrayImage, ImageBuffer, 
 use log::{error, info};
 use ndk_sys::{acamera_metadata_tag, camera_status_t, media_status_t, ACameraCaptureSession, ACameraCaptureSession_setRepeatingRequest, ACameraCaptureSession_stateCallbacks, ACameraDevice, ACameraDevice_StateCallbacks, ACameraDevice_close, ACameraDevice_createCaptureRequest, ACameraDevice_createCaptureSession, ACameraDevice_getId, ACameraDevice_request_template, ACameraIdList, ACameraManager_create, ACameraManager_delete, ACameraManager_deleteCameraIdList, ACameraManager_getCameraCharacteristics, ACameraManager_getCameraIdList, ACameraManager_openCamera, ACameraMetadata, ACameraMetadata_const_entry, ACameraMetadata_free, ACameraMetadata_getConstEntry, ACameraOutputTarget, ACameraOutputTarget_create, ACameraOutputTarget_free, ACaptureRequest, ACaptureRequest_addTarget, ACaptureRequest_free, ACaptureSessionOutput, ACaptureSessionOutputContainer, ACaptureSessionOutputContainer_add, ACaptureSessionOutputContainer_create, ACaptureSessionOutputContainer_free, ACaptureSessionOutput_create, ACaptureSessionOutput_free, AImageCropRect, AImageReader, AImageReader_ImageListener, AImageReader_acquireLatestImage, AImageReader_getFormat, AImageReader_getHeight, AImageReader_getWidth, AImageReader_getWindow, AImageReader_new, AImageReader_setImageListener, AImage_delete, AImage_getCropRect, AImage_getNumberOfPlanes, AImage_getPlaneData, AImage_getPlanePixelStride, AImage_getPlaneRowStride, AImage_getTimestamp, AImage_getWidth, ANativeWindow, AIMAGE_FORMATS};
 use pollster::FutureExt;
-use wgpu::{BindGroup, ComputePipeline, Device, Limits, Queue, Texture};
+use wgpu::{util::{BufferInitDescriptor, DeviceExt}, BindGroup, Buffer, ComputePipeline, Device, Limits, Queue, ShaderModel, Texture, TextureView};
 use winit::platform::android::activity::AndroidApp;
 
 use crate::utils::{self, ffi_helper, permission::get_cache_dir};
@@ -46,6 +46,7 @@ pub struct Camera{
     image_sender: Sender<ImageData>,
     lens_facing: u8,
     sensor_orientation: i32,
+    color_image: Option<ColorImage>
 }
 
 impl Camera{
@@ -66,6 +67,7 @@ impl Camera{
         image_sender,
         lens_facing: 0,
         sensor_orientation: 0,
+        color_image: None,
         }
     }
 
@@ -404,31 +406,39 @@ impl Camera{
              */
 
             let yuv_data = slice::from_raw_parts(y_pixel, ((width*height)+(width*height)/2) as usize);
+
+            let mut timestamp_ns = 0;
+            let _ = AImage_getTimestamp(image, &mut timestamp_ns);
+
             // info!("gpu yuv_data:{}", yuv_data.len());
             let t = Instant::now();
             // info!("start gpu decode...");
             //GPU转换耗时 6~8毫秒左右，有时会是10ms左右
-            self.decoder_gpu.as_mut().unwrap().decode(&yuv_data, &mut self.rgba_buffer)?;
-            let mut rotate_image = RgbaImage::from_raw(width as u32, height as u32, self.rgba_buffer.to_vec()).unwrap();
-            
-            //旋转
-            match self.sensor_orientation{
-                90 => {
-                    rotate_image = rotate90(&rotate_image);
-                }
-                180 => {
-                    rotate_image = rotate180(&rotate_image);
-                }
-                270 => {
-                    rotate_image = rotate270(&rotate_image);
-                }
-                _ =>{
-                    //不用旋转，使用原buffer
-                    
-                }
+            self.decoder_gpu.as_mut().unwrap().decode(&yuv_data, &mut self.rgba_buffer, self.sensor_orientation)?;
+            let (output_width, output_height) = match self.decoder_gpu.as_ref().unwrap().rotate_output_size.as_ref(){
+                None => (width, height),
+                Some(o) => (o.width as i32, o.height as i32)
+            };
+            // ImageData直接构造需要十几ms，太慢
+            // let img = ImageData::Color(ColorImage::from_rgba_unmultiplied([output_width as usize, output_height as usize], &self.rgba_buffer));
+            if self.color_image.is_none(){
+                self.color_image = Some(ColorImage::new([output_width as usize, output_height as usize], Color32::default()));
             }
-            self.image_sender.send(ImageData::Color(ColorImage::from_rgba_unmultiplied([rotate_image.width() as usize, rotate_image.height() as usize], &rotate_image)))?;
-            info!("gpu decode:{}ms {width}x{height} orientation:{} => {}x{}", t.elapsed().as_millis(), self.sensor_orientation, rotate_image.width(), rotate_image.height());
+            self.color_image.as_mut().unwrap().as_raw_mut().copy_from_slice(&self.rgba_buffer);
+            self.image_sender.send(ImageData::Color(self.color_image.clone().unwrap()))?;
+            info!("转码+旋转+Send耗时:{}ms", t.elapsed().as_millis());
+
+            // if self.frame_count % 5 == 0{
+            //     let yuv_path = format!("{}/{}.yuv", get_cache_dir(&self.app)?, timestamp_ns);
+            //     let jpg_path = format!("{}/{}.jpg", get_cache_dir(&self.app)?, timestamp_ns);
+            //     let yuv_data_clone = yuv_data.to_vec();
+            //     std::thread::spawn(move ||{
+            //         let mut f = std::fs::File::create(&yuv_path).unwrap();
+            //         f.write_all(&yuv_data_clone).unwrap();
+            //         rotate_image.save(jpg_path).unwrap();
+            //     });
+            //     info!("保存了1张图片{timestamp_ns}");
+            // }
 
             // 预览回调帧率正常是 30FPS
             self.frame_count += 1;
@@ -534,6 +544,12 @@ struct YuvGpuDecoder{
     compute_yuv_bind_group: BindGroup,
     padded_bytes_per_row: usize,
     unpadded_bytes_per_row: usize,
+
+    rgba_texture_view: TextureView,
+    rotate_compute_pipeline: ComputePipeline,
+    rotate_bind_group: Option<BindGroup>,
+    rotate_output_texture: Option<Texture>,
+    rotate_output_size: Option<wgpu::Extent3d>,
 }
 
 impl YuvGpuDecoder{
@@ -749,11 +765,23 @@ impl YuvGpuDecoder{
 
         let padded_bytes_per_row = YuvGpuDecoder::padded_bytes_per_row(width);
         let unpadded_bytes_per_row = width as usize * 4;
+        
+        let rotate_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("compute_pipeline"),
+            layout: None,
+            module: &device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("compute_shader_module"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rotate.wgsl"))),
+            }),
+            entry_point: "main",
+        });
 
-        Ok(Self { device, queue, width, height, y_texture, u_texture, easu_texture, texture_size, u_size, compute_pipeline_yuv, compute_yuv_bind_group, padded_bytes_per_row, unpadded_bytes_per_row})
+        Ok(Self { device, queue, width, height, y_texture, u_texture, easu_texture, texture_size, u_size, compute_pipeline_yuv, compute_yuv_bind_group, padded_bytes_per_row, unpadded_bytes_per_row, rotate_compute_pipeline, rgba_texture_view: easu_texture_view, rotate_bind_group: None, rotate_output_texture: None, rotate_output_size: None})
     }
 
-    fn decode(&mut self, data: &[u8], output:&mut [u8]) -> Result<()>{
+    fn decode(&mut self, data: &[u8], output:&mut [u8], rotate_degree: i32) -> Result<()>{
+
+        // let t = Instant::now();
         //------------------------------------------------------
         // YUV数据写入纹理中
         //------------------------------------------------------
@@ -797,6 +825,9 @@ impl YuvGpuDecoder{
         //------------------------------------------------------
         // 开始新的计算 pass
         //------------------------------------------------------
+
+        //是否需要旋转
+        let need_rotate = rotate_degree >= 90 && rotate_degree <= 270;
         
 
         let mut encoder = self.device.create_command_encoder(
@@ -810,50 +841,195 @@ impl YuvGpuDecoder{
             cpass.dispatch_workgroups(self.width / 8, self.height / 8, 1);
         }
 
-        let output_buffer_size =
-        self.padded_bytes_per_row as u64 * self.height as u64 * std::mem::size_of::<u8>() as u64;
+        let mut rgba_output_buffer = None;
+        
+        if !need_rotate{
+            //如果不需要旋转，复制处理完成的 rgba纹理到缓冲区
+            let output_buffer_size =
+            self.padded_bytes_per_row as u64 * self.height as u64 * std::mem::size_of::<u8>() as u64;
 
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: output_buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+            let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: output_buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
 
-        encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                aspect: wgpu::TextureAspect::All,
-                texture: &self.easu_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &output_buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.padded_bytes_per_row as u32),
-                    rows_per_image: Some(self.height),
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    aspect: wgpu::TextureAspect::All,
+                    texture: &self.easu_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
                 },
-            },
-            self.texture_size,
-        );
+                wgpu::ImageCopyBuffer {
+                    buffer: &output_buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(self.padded_bytes_per_row as u32),
+                        rows_per_image: Some(self.height),
+                    },
+                },
+                self.texture_size,
+            );
+
+            rgba_output_buffer = Some(output_buffer);
+        }
 
         self.queue.submit(Some(encoder.finish()));
 
-        let buffer_slice = output_buffer.slice(..);
-        buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+        // info!("转换完成 耗时:{}ms", t.elapsed().as_millis());
 
-        self.device.poll(wgpu::Maintain::Wait);
+        //开始旋转
+        if need_rotate{
+            // let t = Instant::now();
+            if self.rotate_bind_group.is_none() {
+                self.rotate_init(rotate_degree);
+            }
 
-        let padded_data = buffer_slice.get_mapped_range();
+            //rgba图像转换完成之后，直接使用rgba_texture_view再次处理旋转
+            let mut encoder = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: None },
+            );
 
-        for (padded, pixels) in padded_data
-            .chunks_exact(self.padded_bytes_per_row)
-            .zip(output.chunks_exact_mut(self.unpadded_bytes_per_row))
-        {
-            pixels.copy_from_slice(&padded[..self.unpadded_bytes_per_row]);
-        }
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default() );
+                cpass.set_pipeline(&self.rotate_compute_pipeline);
+                cpass.set_bind_group(0, self.rotate_bind_group.as_ref().unwrap(), &[]);
+                let workgroup_count_x = (self.texture_size.width + 16 - 1) / 16;
+                let workgroup_count_y = (self.texture_size.height + 16 - 1) / 16;
+                println!("workgroup_count_x={workgroup_count_x}");
+                println!("workgroup_count_y={workgroup_count_y}");
+                cpass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1);
+            }
+
+            let rotate_output_size = self.rotate_output_size.clone().unwrap();
+
+            let padded_bytes_per_row = Self::padded_bytes_per_row(rotate_output_size.width);
+            let unpadded_bytes_per_row = rotate_output_size.width as usize * 4;
+
+            let output_buffer_size =
+                padded_bytes_per_row as u64 * rotate_output_size.height as u64 * std::mem::size_of::<u8>() as u64;
+            let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: output_buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    aspect: wgpu::TextureAspect::All,
+                    texture: self.rotate_output_texture.as_ref().unwrap(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &output_buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row as u32),
+                        rows_per_image: Some(rotate_output_size.height),
+                    },
+                },
+                rotate_output_size,
+            );
+
+            self.queue.submit(Some(encoder.finish()));
+
+            let buffer_slice = output_buffer.slice(..);
+            buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+    
+            self.device.poll(wgpu::Maintain::Wait);
+    
+            let padded_data = buffer_slice.get_mapped_range();
+    
+            for (padded, pixels) in padded_data
+                .chunks_exact(padded_bytes_per_row)
+                .zip(output.chunks_exact_mut(unpadded_bytes_per_row))
+            {
+                pixels.copy_from_slice(&padded[..unpadded_bytes_per_row]);
+            }
+            // info!("旋转完成 耗时:{}ms", t.elapsed().as_millis());
+        }else{
+            let output_buffer = rgba_output_buffer.as_ref().unwrap();
+            let buffer_slice = output_buffer.slice(..);
+            buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+    
+            self.device.poll(wgpu::Maintain::Wait);
+    
+            let padded_data = buffer_slice.get_mapped_range();
+    
+            for (padded, pixels) in padded_data
+                .chunks_exact(self.padded_bytes_per_row)
+                .zip(output.chunks_exact_mut(self.unpadded_bytes_per_row))
+            {
+                pixels.copy_from_slice(&padded[..self.unpadded_bytes_per_row]);
+            }
+        };
+
+
         Ok(())
+    }
+
+    fn rotate_init(&mut self, rotate_degree: i32){
+        //创建旋转缓冲区
+        let (rotate_output_width, rotate_output_height) = if (rotate_degree/90)%2 == 0{
+            (self.texture_size.width, self.texture_size.height)
+        }else{
+            (self.texture_size.height, self.texture_size.width)
+        };
+        let rotate_output_size = wgpu::Extent3d {
+            width: rotate_output_width,
+            height: rotate_output_height,
+            depth_or_array_layers: 1,
+        };
+    
+        // 输出图像
+        let rotate_output_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("output texture"),
+            size: rotate_output_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+
+        // 旋转参数
+        let config_buffer = self.device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            usage: wgpu::BufferUsages::STORAGE,
+            contents: bytemuck::cast_slice(&[rotate_degree]),
+        });
+
+        let rotate_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.rotate_compute_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &self.rgba_texture_view,
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        &rotate_output_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: config_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("bind_group"),
+        });
+
+        self.rotate_bind_group = Some(rotate_bind_group);
+        self.rotate_output_texture = Some(rotate_output_texture);
+        self.rotate_output_size = Some(rotate_output_size);
     }
 
     /// Compute the next multiple of 256 for texture retrieval padding.
